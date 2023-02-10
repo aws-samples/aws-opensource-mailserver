@@ -1,0 +1,685 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+Description: Deploy Mail-in-a-box on EC2. Both new installs and restore from S3 Backups are supported with this template
+Parameters:
+  MailInABoxDomain:
+    Description: DNS Domain to host emails for
+    Type: String
+  InstanceEIP:
+    Description: Elastic IP of Instance
+    Type: String
+    Default: ''
+  BackupS3Bucket:
+    Description: S3 bucket to use for backups
+    Type: String
+  NextCloudS3Bucket:
+    Description: S3 bucket to use for nextcloud data
+    Default: ''
+    Type: String
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    ConstraintDescription: must be a valid EC2 instance type.
+  InstanceAMI:
+    Description: Managed AMI ID for EC2 Instance
+    Type : AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id'
+  InstanceDns:
+    Description: DNS name of Instance (within the 'MailInABoxDomain') 
+    Type: String
+    Default: box
+  MailInABoxVersion:
+    Type: String
+    Default: aws
+  MailInABoxCloneUrl:
+    Type: String
+    Default: https://github.com/mmeidlinger/mailinabox
+  MailInABoxAdminPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+  RestoreKey:
+    Description: Key to decrypt Backup. Leave empty in case of using a newly generated one for new installs
+    Type: String
+    Default: ''
+    NoEcho: true
+  RestoreKeySsmParameterName:
+    Description: Name of SSM Parameter where to save the Restore Key. Key not saved to Ssm in case this is left empty
+    Default: 'MailInABoxRestoreKey'
+    Type: String
+  RestorePrefix:
+    Description: Prefix where backups that are to be restored are located in S3 bucket. Leave empty for a fresh install
+    Default: ''
+    Type: String
+  SesRelay:
+    Description: Set to 'false' if you do not want to configure SES to relay your Emails
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  SmtpIamAccessKeyVersion:
+    Type: Number
+    Default: 1
+    Description: Version number of the AWS access keys used to generate SMTP Credentials. Increment this number to rotate the keys. New keys are not automatically provisioned on the Mail-in-a-Box instance.
+    MinValue: 1
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Label: 
+          default: "Enter your parameters"
+        Parameters: 
+          - MailInABoxDomain
+          - InstanceEIP
+          - BackupS3Bucket
+          - NextCloudS3Bucket
+          - KeyName
+          - InstanceType
+          - InstanceAMI
+          - RestorePrefix
+          - RestoreKeySsmParameterName
+
+Conditions:
+  InstaceEIPProvided:
+    !Not [!Equals [!Ref 'InstanceEIP', '']]
+  NextCloudS3:
+    !Not [!Equals [!Ref 'NextCloudS3Bucket', '']]
+  UseSesRelay:
+    !Equals [!Ref 'SesRelay', 'true']
+  RestoreKeyinSsmParameter:
+    !Not [!Equals [!Ref 'RestoreKeySsmParameterName', '']]
+  NewAdminPasswordToSsm:
+    !And [ !Equals [!Ref 'MailInABoxAdminPassword', ''], !Equals [!Ref 'RestorePrefix', ''] ]
+
+    
+Resources:
+  InstanceEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: InstaceEIPProvided
+    Properties: 
+      EIP: !Ref InstanceEIP
+      InstanceId: !Ref EC2Instance
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Mail-in-a-box Instance
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        Description: 'SSH'
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'DNS (TCP)'
+        FromPort: 53
+        ToPort: 53
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: udp
+        Description: 'DNS (UDP)'
+        FromPort: 53
+        ToPort: 53
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'HTTP'
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'HTTPS'
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'SMTP (STARTTLS)'
+        FromPort: 25
+        ToPort: 25
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'IMAP (STARTTLS)'
+        FromPort: 143
+        ToPort: 143
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'IMAPS'
+        FromPort: 993
+        ToPort: 993
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'SMTPS'
+        FromPort: 465
+        ToPort: 465
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'SMTP Submission'
+        FromPort: 587
+        ToPort: 587
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        Description: 'Sieve Mail filtering'
+        FromPort: 4190
+        ToPort: 4190
+        CidrIp: 0.0.0.0/0
+  
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MailInABoxInstanceRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: BackupS3BucketAccessMIAB
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${BackupS3Bucket}/*
+                  - !Sub arn:aws:s3:::${BackupS3Bucket}
+        - !If
+          - NextCloudS3
+          - PolicyName: NextCloudS3Policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:*
+                  Resource:
+                    - !Sub arn:aws:s3:::${NextCloudS3Bucket}/*
+                    - !Sub arn:aws:s3:::${NextCloudS3Bucket}
+          - !Ref AWS::NoValue
+        - !If
+          - UseSesRelay
+          - PolicyName: SsmParameterAccessSmtpCredentials
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ssm:GetParameter
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/smtp-username-${AWS::StackName}"
+                    - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/smtp-password-${AWS::StackName}"
+          - !Ref AWS::NoValue
+        - !If
+          - RestoreKeyinSsmParameter
+          - PolicyName: SsmParameterAccessRestoreKey
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ssm:PutParameter
+                    - ssm:GetParameter
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${RestoreKeySsmParameterName}"
+                - Effect: Allow
+                  Action:
+                    - ssm:DescribeParameters
+                  Resource: '*'
+          - !Ref AWS::NoValue  
+        - !If
+          - NewAdminPasswordToSsm
+          - PolicyName: SsmParameterAccessMailInABoxAdminPassword
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ssm:PutParameter
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/MailInABoxAdminPassword"
+          - !Ref AWS::NoValue  
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: MailInABoxInstanceProfile
+      Roles: 
+       - !Ref InstanceRole
+
+  MailInABoxAdminPasswordSsmParameter:
+    Condition: NewAdminPasswordToSsm
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /MailInABoxAdminPassword
+      Type: String
+      Value: DefaultToBeUpdatedByInstaller
+      Description: Initial admin Password for Mail-in-a-Box WebUI
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: SmtpCredentialsWaitCondition
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref InstanceAMI
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups: 
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 8
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub MailInABoxInstance-${AWS::StackName}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -x
+          apt-get update
+          apt-get upgrade -o DPkg::Lock::Timeout=120 -y  
+
+          # Pre-Install. Arm64 is not supported by the duplicity ppa used by MIAB, so to get the correct version
+          # (1.0.1 at the time of creation) we use pip install (and install the required dependencies)
+          apt-get install -o DPkg::Lock::Timeout=120 -y \
+            librsync-dev \
+            python3-setuptools \
+            python3-pip \
+            python3-boto3 \
+            unzip \
+            intltool \
+            python-is-python3
+          pip3 install duplicity==1.0.1
+          # snap install duplicity --classic
+          # ln -s /snap/bin/duplicity /usr/bin/duplicity
+
+          # Install awscli and CloudFormation helper scripts
+          cd /tmp
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+          # ---------------- CONFIG
+          # Installer behaviour
+          export NONINTERACTIVE=true
+          export SKIP_NETWORK_CHECKS=true
+          # Storage
+          export STORAGE_ROOT=/home/user-data
+          export STORAGE_USER=user-data
+          # Network and DNS
+          export PRIVATE_IP=$(ec2metadata --local-ipv4)
+          export PUBLIC_IPV6=""
+          export PRIVATE_IPV6=""
+          export MTA_STS_MODE=enforce
+          export PRIMARY_HOSTNAME="${InstanceDns}.${MailInABoxDomain}"
+          if [[ -z "${InstanceEIP}" ]]; then
+            export PUBLIC_IP=$(ec2metadata --public-ipv4)
+          else
+            export PUBLIC_IP="${InstanceEIP}"
+          fi
+          # Setup Admin Account.
+          export EMAIL_ADDR="admin@${MailInABoxDomain}"
+          # If no admin password is specified generate a random one. In that case, we upload this randomly genereated PW to SSM if it's a fresh install
+          if [[ -z "${MailInABoxAdminPassword}" ]]; then
+            export EMAIL_PW=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16 ; echo '')
+            if [[ -z "${RestorePrefix}" ]]; then
+              aws ssm put-parameter \
+                  --overwrite \
+                  --name "/MailInABoxAdminPassword" \
+                  --type SecureString \
+                  --value "$EMAIL_PW"
+            fi
+          else
+            export EMAIL_PW=${MailInABoxAdminPassword}
+          fi
+          # Nextcloud config variables are picked up by the Mail-in-a-Box Setup script
+          export NEXTCLOUD_S3_BUCKET=${NextCloudS3Bucket}
+          export NEXTCLOUD_S3_REGION=$(aws s3api get-bucket-location --bucket $NEXTCLOUD_S3_BUCKET --query 'LocationConstraint' --output 'text')
+          [[ $NEXTCLOUD_S3_REGION == "None" ]]  && NEXTCLOUD_S3_REGION=us-east-1 
+          # Setup SMTP Relay if configured. Variables are picked up by the Mail-in-a-Box Setup script 
+          if [[ "${SesRelay}" == "true" ]]; then
+            export SMTP_RELAY_ENDPOINT="email-smtp.${AWS::Region}.amazonaws.com"
+            export SMTP_RELAY_PORT=587
+            export SMTP_RELAY_USER=$(aws ssm get-parameter --name "/smtp-username-${AWS::StackName}" --with-decryption --query Parameter.Value --output text)
+            export SMTP_RELAY_PASSWORD=$(aws ssm get-parameter --name "/smtp-password-${AWS::StackName}" --with-decryption --query Parameter.Value --output text)
+          fi
+          
+          # ---------------- PRE INSTALL
+          useradd -m $STORAGE_USER
+          mkdir -p $STORAGE_ROOT
+          git clone ${MailInABoxCloneUrl} /opt/mailinabox
+          export TAG=${MailInABoxVersion}
+          cd /opt/mailinabox && git checkout $TAG
+          
+          # ---------------- RESTORE
+          if [[ -n "${RestorePrefix}" ]]; then
+            # Restore files from S3 Backup
+            export S3_URL="s3://${BackupS3Bucket}/${RestorePrefix}"
+            # If we have a RestoreKey passed, use it, otherwise try to load from SSM Parameter.
+            if [[ -n "${RestoreKey}" ]]; then
+              export PASSPHRASE_FULL="${RestoreKey}"
+            elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
+              PASSPHRASE_FULL=$(aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text)
+            else
+              echo "Either 'RestoreKey' or 'RestoreKeySsmParameterName' need to be passed if you want to restore from a Prefix!"
+              exit -1
+            fi
+            # Only the first line of the passphrase is actually used: https://github.com/mail-in-a-box/mailinabox/issues/2209
+            # We save and pass the full passphrase, with space delimiters
+            export PASSPHRASE=$(echo $PASSPHRASE_FULL | awk '{print $1}')
+            duplicity restore --force $S3_URL $STORAGE_ROOT
+          fi
+
+          # ---------------- INSTALL
+          cd /opt/mailinabox/ && setup/start.sh
+
+          # ---------------- POST INSTALL
+          # Configure networking according to https://aws.amazon.com/premiumsupport/knowledge-center/ec2-static-dns-ubuntu-debian/
+          INTERFACE=$(ip route list | grep default | grep -E  'dev (\w+)' -o | awk '{print $2}')
+          cat <<EOT > /etc/netplan/99-custom-dns.yaml
+          network:
+            version: 2
+            ethernets:
+                $INTERFACE:         
+                  nameservers:
+                    addresses: [127.0.0.1]
+                  dhcp4-overrides:
+                    use-dns: false
+          EOT
+          netplan apply
+
+          # Configure Backups, create a new backup folder for instance and trigger an initial backup
+          export RESTORE_S3_REGION=$(aws s3api get-bucket-location --bucket ${BackupS3Bucket} --query 'LocationConstraint' --output 'text')
+          [[ $RESTORE_S3_REGION == "None" ]]  && RESTORE_S3_REGION=us-east-1 
+          export INSTANCE_ID=$(ec2metadata --instance-id)
+          echo "Mail-in-a-box ($TAG) backups for instance $INSTANCE_ID created on $(date -Im) " > /tmp/README.txt
+          aws s3 cp /tmp/README.txt s3://${BackupS3Bucket}/$INSTANCE_ID/README.txt
+          mkdir -p $STORAGE_ROOT/backup
+          cat <<EOT > $STORAGE_ROOT/backup/custom.yaml
+          min_age_in_days: 7
+          target: s3://s3.$RESTORE_S3_REGION.amazonaws.com/${BackupS3Bucket}/$INSTANCE_ID
+          target_user: ""
+          target_pass: ""
+          EOT
+          # Save 'RestoreKey' or 'RestoreKeySsmParameterName' that were passed locally or upload newly created in case this is a new install
+          if [[ -z "${RestorePrefix}" ]]; then
+            if [[ -n "${RestoreKey}" ]]; then
+              echo "${RestoreKey}" | tr ' ' '\n'  > $STORAGE_ROOT/backup/secret_key.txt
+            elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
+              # check if SSM Parameter exists. If yes use it locally. If not, save the freshly generated key to SSM
+              pram_exists="$(aws ssm describe-parameters --filters "Key=Name,Values=/${RestoreKeySsmParameterName}" --query Parameters --output text )"
+              if [[ -n "$pram_exists" ]]; then
+                aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text | tr ' ' '\n'  > $STORAGE_ROOT/backup/secret_key.txt
+              else
+                aws ssm put-parameter \
+                  --overwrite \
+                  --name "/${RestoreKeySsmParameterName}" \
+                  --type SecureString \
+                  --value "$(cat $STORAGE_ROOT/backup/secret_key.txt |tr '\n' ' ' )"
+              fi
+            fi
+          fi
+
+          cd /opt/mailinabox
+          # Provision SSL Certificates
+          management/ssl_certificates.py
+          # Create Initial Backup
+          management/backup.py
+
+          # Clear logs for key contents
+          rm /var/lib/cloud/instances/$INSTANCE_ID/scripts/part-00* \
+             /var/lib/cloud/instances/$INSTANCE_ID/user-data.txt* \
+             /var/lib/cloud/instances/$INSTANCE_ID/obj.pkl
+
+          # Signal Success to CloudFormation
+          # We don't wait for the signal as this prevents the EIP from being associated with the instance already during setup, complicating certificate provisioning
+          # /usr/local/bin/cfn-signal --success true --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+          # Reboot
+          reboot
+
+  SmtpCredentialsWaitHandleUnconditional: 
+    Type: "AWS::CloudFormation::WaitConditionHandle"
+
+  SmtpCredentialsWaitHandleConditional: 
+    Condition: UseSesRelay
+    DependsOn: SmtpPassword
+    Type: "AWS::CloudFormation::WaitConditionHandle"
+
+  SmtpCredentialsWaitCondition: 
+    Type: "AWS::CloudFormation::WaitCondition"
+    Properties: 
+      Handle: !If [UseSesRelay, !Ref SmtpCredentialsWaitHandleConditional, !Ref SmtpCredentialsWaitHandleUnconditional]
+      Timeout: "1"
+      Count: 0
+
+  SmtpUserGroup:
+    Condition: UseSesRelay
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub SMTPUserGroup-${AWS::StackName}
+  SmtpUser:
+    Condition: UseSesRelay
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub SMTPUser-${AWS::StackName}
+      Groups:
+        - !Ref SmtpUserGroup
+  SmtpUserPolicy:
+    Condition: UseSesRelay
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub SMTPUserPolicy-${AWS::StackName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: ses:SendRawEmail
+            Resource: '*'
+            Condition: 
+              StringLike:
+                'ses:FromAddress': !Sub '*@${MailInABoxDomain}'
+      Groups:
+        - !Ref SmtpUserGroup
+  SmtpUserAccessKey:
+    Condition: UseSesRelay
+    Type: AWS::IAM::AccessKey
+    Properties:
+      Serial: !Ref SmtpIamAccessKeyVersion
+      Status: Active
+      UserName: !Ref SmtpUser
+
+  SmtpPassword:
+    Condition: UseSesRelay
+    DependsOn: SmtpUsername
+    Type: Custom::SmtpPassword
+    Properties:
+      ServiceToken: !GetAtt SmtpLambdaFunction.Arn
+      Key: !GetAtt SmtpUserAccessKey.SecretAccessKey
+      ParameterType: password
+
+  SmtpUsername:
+    Condition: UseSesRelay
+    Type: Custom::SmtpUsername
+    Properties:
+      ServiceToken: !GetAtt SmtpLambdaFunction.Arn
+      Key: !Ref SmtpUserAccessKey
+      ParameterType: username
+
+  SmtpLambdaExecutionRole:
+    Condition: UseSesRelay
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub SMTPLambdaExecutionRole-${AWS::StackName}
+      Description: Role assumed by Lambda to generate SMTP credentials
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InlineSMTPLambdaExecutionRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/smtp-username-${AWS::StackName}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/smtp-password-${AWS::StackName}"
+
+  SmtpLambdaFunction:
+    Condition: UseSesRelay
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Generates SMTP credentials and stores in Parameter Store
+      FunctionName: !Sub SMTPCredentialsLambdaFunction-${AWS::StackName}
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt SmtpLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Timeout: 30
+      Code:
+        ZipFile: !Sub |
+          import hmac
+          import hashlib
+          import base64
+          import argparse
+          import boto3
+          from botocore.exceptions import ClientError
+          import json
+          import cfnresponse
+          import urllib3
+          import logging
+          import os
+
+          logging.basicConfig(level=logging.DEBUG)
+          log = logging.getLogger(__name__)
+          region = os.environ['AWS_REGION']
+          ssm = boto3.client('ssm',region_name=region)
+
+          SMTP_REGIONS = [
+              'us-east-2',       # US East (Ohio)
+              'us-east-1',       # US East (N. Virginia)
+              'us-west-2',       # US West (Oregon)
+              'ap-south-1',      # Asia Pacific (Mumbai)
+              'ap-northeast-2',  # Asia Pacific (Seoul)
+              'ap-southeast-1',  # Asia Pacific (Singapore)
+              'ap-southeast-2',  # Asia Pacific (Sydney)
+              'ap-northeast-1',  # Asia Pacific (Tokyo)
+              'ca-central-1',    # Canada (Central)
+              'eu-central-1',    # Europe (Frankfurt)
+              'eu-west-1',       # Europe (Ireland)
+              'eu-west-2',       # Europe (London)
+              'sa-east-1',       # South America (Sao Paulo)
+              'us-gov-west-1',   # AWS GovCloud (US)
+          ]
+
+          # These values are required to calculate the signature. Do not change them.
+          DATE = "11111111"
+          SERVICE = "ses"
+          MESSAGE = "SendRawEmail"
+          TERMINAL = "aws4_request"
+          VERSION = 0x04
+
+          def sign(key, msg):
+              return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+
+          def calculate_key(secret_access_key, region):
+              if region not in SMTP_REGIONS:
+                  raise ValueError(f"The {region} Region doesn't have an SMTP endpoint.")
+
+              signature = sign(("AWS4" + secret_access_key).encode('utf-8'), DATE)
+              signature = sign(signature, region)
+              signature = sign(signature, SERVICE)
+              signature = sign(signature, TERMINAL)
+              signature = sign(signature, MESSAGE)
+              signature_and_version = bytes([VERSION]) + signature
+              smtp_password = base64.b64encode(signature_and_version)
+              return smtp_password.decode('utf-8')
+
+          def put_parameter(value,type):
+            try:
+              ssm.put_parameter(
+                      Name='smtp-' + type + '-${AWS::StackName}',
+                      Description='SMTP '+type+' for email communications',
+                      Value=value,
+                      Type='SecureString',
+                      Overwrite=True,
+                      Tier='Standard'
+                  )
+              return True
+            except Exception as e:
+              print("Error putting parameter smtp-"+type+"-${AWS::StackName}: "+str(e))
+              return False
+
+          def delete_smtp_credentials(type):
+            try:
+              ssm.delete_parameter(Name='smtp-'+type+'-${AWS::StackName}')
+              return True
+            except Exception as e:
+              print("Error deleting parameter smtp-"+type+"-${AWS::StackName}: "+str(e))
+              return False
+
+
+          def lambda_handler(event, context):
+            log.debug('%s', event)
+            parameter_type = event['ResourceProperties']['ParameterType']
+            parameter_arn = "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/smtp-"+parameter_type+"-${AWS::StackName}"
+            key = event['ResourceProperties']['Key']
+            proceed = "True"
+
+            if event['RequestType'] == 'Create':
+              if parameter_type == 'username':
+                proceed = put_parameter(key, parameter_type)
+              elif parameter_type == 'password':
+                pwd = calculate_key(key, region)
+                proceed = put_parameter(pwd, parameter_type)
+              reason = "Created SMTP "+parameter_type
+            elif event['RequestType'] == 'Update':
+              if parameter_type == 'username':
+                proceed = put_parameter(key, parameter_type)
+              elif parameter_type == 'password':
+                pwd = calculate_key(key, region)
+                proceed = put_parameter(pwd, parameter_type)
+              reason = "Updated SMTP "+parameter_type
+            elif event['RequestType'] == 'Delete':
+              proceed = delete_smtp_credentials(parameter_type)
+              reason = "Deleted SMTP "+parameter_type
+            else:
+              proceed = False
+              reason = "Operation %s is unsupported" % (event['RequestType'])
+
+            if proceed:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Reason': reason}, parameter_arn)
+            else:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Reason': reason}, parameter_arn)
+
+Outputs:
+  InstancePublicIp:
+    Description: The Public IP of the Mail-in-a-box instance
+    Value: !GetAtt EC2Instance.PublicIp
+  AdminPassword:
+    Description: Name of the SSM Parameter containing the Admin Password to Mail-in-a-box Web-UI
+    Condition: NewAdminPasswordToSsm
+    Value: !Ref MailInABoxAdminPasswordSsmParameter
