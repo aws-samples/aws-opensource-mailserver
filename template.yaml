@@ -18,7 +18,7 @@ Parameters:
     Default: ''
     Type: String
   KeyName:
-    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Description: 'Mandatory: Name of an existing EC2 key pair to enable SSH access to the instance'
     Type: AWS::EC2::KeyPair::KeyName
     ConstraintDescription: must be the name of an existing EC2 KeyPair.
   InstanceType:
@@ -265,6 +265,10 @@ Resources:
   EC2Instance:
     Type: AWS::EC2::Instance
     DependsOn: SmtpCredentialsWaitCondition
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+        Count: 1
     Properties:
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
@@ -284,7 +288,7 @@ Resources:
           Value: !Sub MailInABoxInstance-${AWS::StackName}
       UserData:
         Fn::Base64: !Sub |
-          #!/bin/bash -x
+          #!/bin/bash -xe
           apt-get update
           apt-get upgrade -o DPkg::Lock::Timeout=120 -y  
 
@@ -378,6 +382,9 @@ Resources:
             # We save and pass the full passphrase, with space delimiters
             export PASSPHRASE=$(echo $PASSPHRASE_FULL | awk '{print $1}')
             duplicity restore --force $S3_URL $STORAGE_ROOT
+            # Continue using the secret key for subsequent backups
+            mkdir -p $STORAGE_ROOT/backup
+            echo $PASSPHRASE_FULL | tr ' ' '\n'  > $STORAGE_ROOT/backup/secret_key.txt
           fi
 
           # ---------------- INSTALL
@@ -416,9 +423,9 @@ Resources:
             if [[ -n "${RestoreKey}" ]]; then
               echo "${RestoreKey}" | tr ' ' '\n'  > $STORAGE_ROOT/backup/secret_key.txt
             elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
-              # check if SSM Parameter exists. If yes use it locally. If not, save the freshly generated key to SSM
-              pram_exists="$(aws ssm describe-parameters --filters "Key=Name,Values=/${RestoreKeySsmParameterName}" --query Parameters --output text )"
-              if [[ -n "$pram_exists" ]]; then
+              # check if SSM Parameter exists. If yes retrieve and use it going forward. If not, save the freshly generated key to SSM
+              restore_key_param_exists="$(aws ssm describe-parameters --filters "Key=Name,Values=/${RestoreKeySsmParameterName}" --query Parameters --output text )"
+              if [[ -n "$restore_key_param_exists" ]]; then
                 aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text | tr ' ' '\n'  > $STORAGE_ROOT/backup/secret_key.txt
               else
                 aws ssm put-parameter \
@@ -430,11 +437,8 @@ Resources:
             fi
           fi
 
-          cd /opt/mailinabox
-          # Provision SSL Certificates
-          management/ssl_certificates.py
           # Create Initial Backup
-          management/backup.py
+          /opt/mailinabox/management/backup.py
 
           # Clear logs for key contents
           rm /var/lib/cloud/instances/$INSTANCE_ID/scripts/part-00* \
@@ -442,8 +446,7 @@ Resources:
              /var/lib/cloud/instances/$INSTANCE_ID/obj.pkl
 
           # Signal Success to CloudFormation
-          # We don't wait for the signal as this prevents the EIP from being associated with the instance already during setup, complicating certificate provisioning
-          # /usr/local/bin/cfn-signal --success true --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+          /usr/local/bin/cfn-signal --success true --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
           # Reboot
           reboot
 
@@ -683,3 +686,6 @@ Outputs:
     Description: Name of the SSM Parameter containing the Admin Password to Mail-in-a-box Web-UI
     Condition: NewAdminPasswordToSsm
     Value: !Ref MailInABoxAdminPasswordSsmParameter
+  RestorePrefix:
+    Description: The S3 prefix where backups are stored is set to the ID of the EC2 instance of your current deployment
+    Value: !Ref EC2Instance
