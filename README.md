@@ -31,6 +31,7 @@ We also provide an optional integration with [Amazon Simple Email Service (Amazo
    * [Cleaning up](#cleaning-up)
    * [Outlook](#outlook)
    * [Conclusion](#conclusion)
+* [Related Projects](#related-projects)
 * [Security](#security)
 * [License](#license)
 
@@ -148,6 +149,10 @@ Depending on your requirements, extending the solution and distributing componen
 In this sample, we showed how to automate the deployment of an open source mail server on AWS and how to quickly and effortlessly restore from a backup for rolling out immutable updates and providing high resiliency. Using AWS CloudFormation infrastructure automations and integrations with managed services such as Amazon S3 and Amazon SES, the lifecycle management and operation of open source mail servers on AWS can be simplified significantly. Once deployed, the solution provides an end-user experience similar to popular SaaS and commercial offerings.
 
 You can go ahead and use the automations provided in this sample to get started with running your own open source mail server on AWS!
+
+# Related Projects
+
+- [**lightsail-miab-installer**](https://github.com/rioastamal/lightsail-miab-installer): A user-friendly command-line tool designed to streamline the setup of Mail-in-a-Box on Amazon Lightsail.
 
 # Security
 
